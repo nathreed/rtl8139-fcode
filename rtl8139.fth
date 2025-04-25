@@ -18,9 +18,12 @@ fcode-version3
 	38 constant capr-reg \ Current Address of Packet Read (where we will start reading in the RX buffer next time we RX. 2-byte register)
 	d# 1500 constant mtu \ Ethernet packet payload max MTU is 1500 bytes per standard
 	10 constant tx-descriptor-0-status-reg
-	64 constant tx-delay-ms \ 100ms for TX delay
+	3e8 constant tx-delay-ms \ 1000ms for TX delay
 	3a constant cbr-reg \ Current Buffer Address (where the device is writing in the RX buffer. 2-byte register)
 	rx-buffer-len d# 1536 - constant rx-buffer-nominal-len \ Nominal length of RX buffer (ignoring 1.5K allocated for wrap overrun). Used to determine overrun amount for handling wrap behavior.
+	3e constant isr-reg \ 2 byte register interrupt status
+	40 constant tx-config-reg \ 4 byte register, transmit configuration register (datasheet pp.14-15)
+	60 constant tsad-reg \ transmit status of all descriptors, 2-byte register (datasheet pp.24)
 
 	\ Instance values for RTL8139 driver
 	0 instance value op-regs-base \ base virtual address for RTL8139 operational registers, mapped in during open function
@@ -106,23 +109,15 @@ fcode-version3
 		\ 1600 bytes should be fine
 		tx-descriptor-len " dma-alloc" $call-parent to tx-descriptor-vaddr \ Allocate 1600 bytes of memory for DMA
 
-		\ Zero allocated memory to prevent issues
-		tx-descriptor-vaddr tx-descriptor-len erase
-
-		\ TEMP: write sentinel values where the destination MAC address would go
-		1 tx-descriptor-vaddr 1 + c!
-		2 tx-descriptor-vaddr 2 + c!
-		3 tx-descriptor-vaddr 3 + c!
-		4 tx-descriptor-vaddr 4 + c!
-		5 tx-descriptor-vaddr 5 + c!
-
 		\ Program start bus address into Tx Start Address Desc 0 register (0x20-0x23 4-byte write)
 		\ Obtain and store bus address
 		tx-descriptor-vaddr tx-descriptor-len false " dma-map-in" $call-parent to tx-descriptor-baddr
 		\ Program Tx Start Address Desc 0 register with bus address
 		tx-descriptor-baddr tx-descriptor-0-start-reg reg-write4
 
-		
+		\ Set DMA burst size in Transmit Configuration Register
+		\ Also make sure 1,1 are set for interframe gap time since any other value violates the spec
+		3000600 tx-config-reg reg-write4
 	;
 
 	\ Basic setup for RX operation (DMA allocation, receive configuration)
@@ -244,6 +239,8 @@ fcode-version3
 		\ obp-tftp init for booting
 		init-obp-tftp 0= if close false exit then
 
+		." TSAD " tsad-reg reg-read2 .h cr
+
 		\ return true for successful open
 		true
 	;
@@ -256,6 +253,8 @@ fcode-version3
 			0 exit \ Return 0 bytes actually written
 		then
 
+		." TSAD " tsad-reg reg-read2 .h cr
+
 		\ 1. (src-addr, len, len) 2. (len, len, src-addr) 3. (len, len, src-addr, dest-addr) 4. (len, src-addr, dest-addr, len)
 		dup rot tx-descriptor-vaddr rot \ make the arguments how we need for the move
 		\ Copy the memory into the Tx descriptor
@@ -266,26 +265,31 @@ fcode-version3
 
 		\ Tell the device the size and give it the ownership of the TX buffer (one operation)
 		dup ( len, len )
-		tx-descriptor-0-status-reg reg-write2 \ stack is now (len), write data to TX descriptor 0 register. This is the size and then we also set OWN bit to 0, handing ownership of the buffer to the device
+		\ use reg-write4 per datasheet "these registers are only permitted to write by double-word access"
+		tx-descriptor-0-status-reg reg-write4 \ write data to TX descriptor 0 register. This is the size and then we also set OWN bit to 0, handing ownership of the buffer to the device
+		\ stack is now (len), 
 
 		\ Check bit 15 for TX completion
 		\ Completion must happen within 10ms
 		tx-delay-ms 0 do
 			1 ms \ delay
 			tx-descriptor-0-status-reg reg-read2 8000 and \ check bit 15
-			0 = if leave then
+			0 > if leave then \ exit loop early if bit 15 is set (result is greater than 0)
 		loop
 
 		\ Verify we have completion
 		tx-descriptor-0-status-reg reg-read2 8000 and
 		0 > if
 			." Transmitted packet." cr
-			tx-descriptor-0-status-reg reg-read2 .h cr
+			." TX Status reg " tx-descriptor-0-status-reg reg-read2 .h cr
+			." ISR " isr-reg reg-read2 .h cr
+			." TSAD " tsad-reg reg-read2 .h cr
 		else
 			." Packet did not transmit in time!" cr
 			\ Output tx descriptor 0 status reg for debug purposes
-			tx-descriptor-0-status-reg reg-read2 .h cr
-			0 exit
+			." TX Status reg " tx-descriptor-0-status-reg reg-read2 .h cr
+			." TSAD " tsad-reg reg-read2 .h cr
+			drop 0 exit \ drop full packet len, replace with 0, return
 		then
 
 		\ len is still on the stack; we return it because we have written the whole thing.
@@ -318,7 +322,7 @@ fcode-version3
 			to last-rx-wrap-len \ ( addr, len, frame length ) - NOTE that in theory we could have this on the stack since we only use it later on in this function but that makes the stack a lot more complex
 		else
 			\ This is an EtherType value
-			." EtherType packet RX not yet implemented" cr
+			." EtherType packet RX not yet implemented, EtherType bytes: " dup .h cr
 			0800 = if
 				." IPv4 EtherType" cr
 			else 0806 = if
@@ -332,7 +336,7 @@ fcode-version3
 		\ Now we know the length
 		\ Copy the bytes the caller has requested. Ensure we only copy the lesser of what was requested and what we have available.
 		\ Stack is currently ( addr, len, frame length )
-		min ( addr, length to transfer )
+		min \ take min of len and frame length, stack is now ( addr, length to transfer )
 		\ Starting address of the ethernet frame (previously we added 12 to get the length field)
 		capr-reg reg-read2 rx-buffer-vaddr + w@ rot ( src_addr, dest_addr, length to transfer )
 		dup rot swap 3 pick rot swap ( src, length to transfer , src, dest, length to transfer )
