@@ -9,16 +9,18 @@ fcode-version3
 	\ Constants for RTL8139 driver
 	100 constant op-regs-len
 	37 constant command-register
-	10 constant reset-delay-ms
+	10 constant reset-delay-ms \ 16ms for SW reset
 	d# 1600 constant tx-descriptor-len
 	20 constant tx-descriptor-0-start-reg
 	d# 34320 constant rx-buffer-len
 	30 constant rx-buffer-reg
 	44 constant recv-config-reg
-	38 constant capr-reg \ Current Address of Packet Read
-	d# 1580 constant mtu \ somewhat arbitrary value set below 1600 Tx descriptor size
+	38 constant capr-reg \ Current Address of Packet Read (where we will start reading in the RX buffer next time we RX. 2-byte register)
+	d# 1500 constant mtu \ Ethernet packet payload max MTU is 1500 bytes per standard
 	10 constant tx-descriptor-0-status-reg
-	10 constant tx-delay-ms
+	64 constant tx-delay-ms \ 100ms for TX delay
+	3a constant cbr-reg \ Current Buffer Address (where the device is writing in the RX buffer. 2-byte register)
+	rx-buffer-len d# 1536 - constant rx-buffer-nominal-len \ Nominal length of RX buffer (ignoring 1.5K allocated for wrap overrun). Used to determine overrun amount for handling wrap behavior.
 
 	\ Instance values for RTL8139 driver
 	0 instance value op-regs-base \ base virtual address for RTL8139 operational registers, mapped in during open function
@@ -27,6 +29,8 @@ fcode-version3
 	0 instance value rx-buffer-vaddr \ virtual address for RX buffer (34320 bytes)
 	0 instance value rx-buffer-baddr \ bus address for RX buffer (34320 bytes)
 	0 instance value mac-buffer-addr \ address of 8-byte buffer to store MAC address (this feels silly but done in the interest of expediency to get an address that will work with encode-bytes) 
+	0 instance value last-rx-wrap-len \ the number of bytes past the nominal length of the RX buffer the last received packet overran. Used to compute offset of next packet from top of RX buffer. See datasheet pp17 for WRAP behavior.
+	0 instance value obp-tftp \ ihandle of TFTP boot package
 
 	\ Read RTL8139 operational register (1 byte)
 	: reg-read	( reg offset -- 1 byte of data from that offset )
@@ -62,6 +66,11 @@ fcode-version3
 	: reg-write4 ( 4 bytes of data to write, reg offset -- )
 		op-regs-base +
 		rl!
+	;
+
+	\ Sync DMA region, use after writing/before reading
+	: my-dma-sync ( virt devaddr size -- )
+		" dma-sync" $call-parent
 	; 
 
 	\ Perform a software reset of the RTL8139
@@ -97,6 +106,16 @@ fcode-version3
 		\ 1600 bytes should be fine
 		tx-descriptor-len " dma-alloc" $call-parent to tx-descriptor-vaddr \ Allocate 1600 bytes of memory for DMA
 
+		\ Zero allocated memory to prevent issues
+		tx-descriptor-vaddr tx-descriptor-len erase
+
+		\ TEMP: write sentinel values where the destination MAC address would go
+		1 tx-descriptor-vaddr 1 + c!
+		2 tx-descriptor-vaddr 2 + c!
+		3 tx-descriptor-vaddr 3 + c!
+		4 tx-descriptor-vaddr 4 + c!
+		5 tx-descriptor-vaddr 5 + c!
+
 		\ Program start bus address into Tx Start Address Desc 0 register (0x20-0x23 4-byte write)
 		\ Obtain and store bus address
 		tx-descriptor-vaddr tx-descriptor-len false " dma-map-in" $call-parent to tx-descriptor-baddr
@@ -113,6 +132,9 @@ fcode-version3
 		\ Allocate DMA memory for Rx buffer
 		\ Rx buffer will be 32K but we want to use wrapping. Total size will be 32K + 16 byte + 1536 bytes = 0x8610 bytes (34320 bytes)
 		rx-buffer-len " dma-alloc" $call-parent to rx-buffer-vaddr
+
+		\ Zero allocated memory to prevent issues
+		rx-buffer-vaddr rx-buffer-len erase
 
 		\ Program Rx buffer start address register
 		\ Obtain bus address first
@@ -151,6 +173,34 @@ fcode-version3
 		mac-buffer-addr 6 encode-bytes " local-mac-address" property \ expose local-mac-address property as well (optional)
 	;
 
+	\ TFTP init copied from Sun driver example
+	: init-obp-tftp ( -- okay? )
+		" obp-tftp" find-package if my-args rot open-package else 0
+		then
+		dup to obp-tftp dup 0= if
+		( phandle )
+		( ihandle )
+		( ihandle | 0 )
+		." Cannot open OBP standard TFTP package" cr
+		then
+	;
+
+	\ Open Firmware standard close function, clean up from device
+	: close
+		\ Unmap operational register base address
+		op-regs-base op-regs-len " map-out" $call-parent
+		\ Disable memory space access and bus mastering
+		0 my-space 04 + " config-w!" $call-parent \ write 0 to command register (04)
+		\ Unmap and free DMA memory
+		tx-descriptor-baddr tx-descriptor-len " dma-map-out" $call-parent \ unmap DMA
+		tx-descriptor-vaddr tx-descriptor-len " dma-free" $call-parent 
+		rx-buffer-baddr rx-buffer-len " dma-map-out" $call-parent
+		rx-buffer-vaddr rx-buffer-len " dma-free" $call-parent 
+		mac-buffer-addr 8 free-mem \ MAC buffer
+
+		obp-tftp ?dup if close-package then
+	;
+
 
 	\ Open Firmware standard open function, get the device ready for use
 	: open
@@ -185,36 +235,34 @@ fcode-version3
 		\ MTU property, 1580 is a somewhat arbitrary value set below 1600 bytes Tx descriptor allocation size
 		mtu encode-int " max-frame-size" property
 
+		" RTL,8139" device-name
+		" network" device-type
+		" ethernet" encode-string " network-type" property
+		" network" encode-string " removable" property
+		" net" encode-string " category" property
+
+		\ obp-tftp init for booting
+		init-obp-tftp 0= if close false exit then
+
 		\ return true for successful open
 		true
-	;
-
-	\ Open Firmware standard close function, clean up from device
-	: close
-		\ Unmap operational register base address
-		op-regs-base op-regs-len " map-out" $call-parent
-		\ Disable memory space access and bus mastering
-		0 my-space 04 + " config-w!" $call-parent \ write 0 to command register (04)
-		\ Unmap and free DMA memory
-		tx-descriptor-baddr tx-descriptor-len " dma-map-out" $call-parent \ unmap DMA
-		tx-descriptor-vaddr tx-descriptor-len " dma-free" $call-parent 
-		rx-buffer-baddr rx-buffer-len " dma-map-out" $call-parent
-		rx-buffer-vaddr rx-buffer-len " dma-free" $call-parent 
-		mac-buffer-addr 8 free-mem \ MAC buffer
 	;
 
 	\ Open Firmware standard write method for network device, returns actual number of bytes written
 	\ Packet must be complete with all addressing information, including source hardware address
 	: write ( src-addr len -- actual )
-		dup mtu > if \ duplicate the length so we can use it again then make sure it's not greater than 1580 (Tx buffer is 1600 bytes)
+		dup mtu > if \ duplicate the length so we can use it again then make sure it's not greater than MTU
 			." RTL8139: Attempted to write data exceeding one MTU, this is not implemented!" cr
 			0 exit \ Return 0 bytes actually written
 		then
 
-		\ 1. (src-addr, len, len) 2. (len, src-addr, len), 3. (len, len, src-addr) 4. (len, len, src-addr, dest-addr), 5. (len, src-addr, dest-addr, len) 
-		dup rot swap tx-descriptor-vaddr rot \ make the arguments how we need for the move
+		\ 1. (src-addr, len, len) 2. (len, len, src-addr) 3. (len, len, src-addr, dest-addr) 4. (len, src-addr, dest-addr, len)
+		dup rot tx-descriptor-vaddr rot \ make the arguments how we need for the move
 		\ Copy the memory into the Tx descriptor
 		move \ perform the memory copy, stack is now (len)
+
+		\ Flush caches for DMA
+		tx-descriptor-vaddr tx-descriptor-baddr tx-descriptor-len my-dma-sync
 
 		\ Tell the device the size and give it the ownership of the TX buffer (one operation)
 		dup ( len, len )
@@ -232,16 +280,86 @@ fcode-version3
 		tx-descriptor-0-status-reg reg-read2 8000 and
 		0 > if
 			." Transmitted packet." cr
+			tx-descriptor-0-status-reg reg-read2 .h cr
 		else
 			." Packet did not transmit in time!" cr
+			\ Output tx descriptor 0 status reg for debug purposes
+			tx-descriptor-0-status-reg reg-read2 .h cr
 			0 exit
 		then
 
 		\ len is still on the stack; we return it because we have written the whole thing.
 	;
 
-	: arp-send
+	\ Open Firmware standard read method for network device
+	\ Returns actual number of bytes received or -2 if no packet is currently available
+	: read ( addr len -- retval )
+		\ If CAPR != CBR, there is a packet ready for us to receive, if not, there is no packet
+		capr-reg reg-read2 cbr-reg reg-read2 = if
+			." No packet available" cr
+			2drop \ remove addr and len arguments from stack
+			-2 exit \ return -2 for no packet available
+		then
 
+		\ Determine the length of the packet
+		\ We start by fetching the 2-byte value from the Ethernet frame header that is either the length or the EtherType
+		capr-reg reg-read2 \ Get the offset into the RX buffer where the next packet starts
+		dup \ Save CAPR value for use when handling length, stack is now (addr, len, capr value, capr value)
+		rx-buffer-vaddr + c + w@ \ Fetch the 2-byte value from the RX buffer start address offset by the CAPR value + 12 for offset of length field
+		\ stack is now (addr, len, capr value, ethernet frame length)
+		dup d# 1536 < if ( addr, len, capr value, ethernet frame length )
+			\ This is a length value
+			\ Compute and save overrun amount (if any)
+			dup rot \ Save frame length for use after if statement ( addr, len, ethernet frame length, capr value, ethernet frame length )
+			+ ( addr, len, ethernet frame length, offset of first byte past end of packet )
+			rx-buffer-nominal-len - \ compute end offset - nominal length = overrun amount ( addr, len, frame length, overrun amount)
+			0 max \ Compute overrun amount, negative overrun means we did not overrun so we clamp to 0
+			dup ." Overrun is " s. cr
+			to last-rx-wrap-len \ ( addr, len, frame length ) - NOTE that in theory we could have this on the stack since we only use it later on in this function but that makes the stack a lot more complex
+		else
+			\ This is an EtherType value
+			." EtherType packet RX not yet implemented" cr
+			0800 = if
+				." IPv4 EtherType" cr
+			else 0806 = if
+				." ARP EtherType" cr then
+			then
+		then
+
+		\ Flush caches for DMA before we read
+		rx-buffer-vaddr rx-buffer-baddr rx-buffer-len my-dma-sync
+
+		\ Now we know the length
+		\ Copy the bytes the caller has requested. Ensure we only copy the lesser of what was requested and what we have available.
+		\ Stack is currently ( addr, len, frame length )
+		min ( addr, length to transfer )
+		\ Starting address of the ethernet frame (previously we added 12 to get the length field)
+		capr-reg reg-read2 rx-buffer-vaddr + w@ rot ( src_addr, dest_addr, length to transfer )
+		dup rot swap 3 pick rot swap ( src, length to transfer , src, dest, length to transfer )
+		move \ do the copy
+		nip \ remove extra src ( length to transfer )
+
+		\ Set CAPR to reflect that we processed the packet we know about
+		last-rx-wrap-len 0 > if
+			\ We had an overrun, new CAPR is beginning of buffer + overrun amount
+			rx-buffer-vaddr last-rx-wrap-len + capr-reg reg-write2 ( length to transfer )
+			\ overrun amount will be reset next time we read
+		else
+			\ New CAPR is old CAPR plus frame length
+			\ Note we have to read frame length from memory again because the length we have on the stack now is the length to transfer
+			\ If client requested less we wouldn't advance CAPR by enough.
+			capr-reg reg-read2 rx-buffer-vaddr + c + w@ \ read frame length from beginning of frame (length to transfer, full frame length)
+			capr-reg reg-read2 + capr-reg reg-write2 \ add full frame length to current CAPR value and return ( length to transfer)
+		then
+
+		\ Stack is still (length actually received)
+		\ Return out the length actually received
+	;
+
+	\ Open Firmware standard load function for bootable network device
+	\ Uses obp-tftp
+	: load
+		" load" obp-tftp $call-method
 	;
 
 
