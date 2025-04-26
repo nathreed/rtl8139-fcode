@@ -11,14 +11,12 @@ fcode-version3
 	37 constant command-register
 	10 constant reset-delay-ms \ 16ms for SW reset
 	d# 1600 constant tx-descriptor-len
-	20 constant tx-descriptor-0-start-reg
 	d# 34320 constant rx-buffer-len
 	30 constant rx-buffer-reg
 	44 constant recv-config-reg
 	38 constant capr-reg \ Current Address of Packet Read (where we will start reading in the RX buffer next time we RX. 2-byte register)
 	d# 1500 constant mtu \ Ethernet packet payload max MTU is 1500 bytes per standard
-	10 constant tx-descriptor-0-status-reg
-	3e8 constant tx-delay-ms \ 1000ms for TX delay
+	64 constant tx-delay-ms \ 100ms for TX delay
 	3a constant cbr-reg \ Current Buffer Address (where the device is writing in the RX buffer. 2-byte register)
 	rx-buffer-len d# 1536 - constant rx-buffer-nominal-len \ Nominal length of RX buffer (ignoring 1.5K allocated for wrap overrun). Used to determine overrun amount for handling wrap behavior.
 	3e constant isr-reg \ 2 byte register interrupt status
@@ -27,13 +25,26 @@ fcode-version3
 
 	\ Instance values for RTL8139 driver
 	0 instance value op-regs-base \ base virtual address for RTL8139 operational registers, mapped in during open function
-	0 instance value tx-descriptor-vaddr \ virtual address for TX descriptor 0 (1600 bytes)
-	0 instance value tx-descriptor-baddr \ bus address for TX descriptor 0 (1600 bytes)
 	0 instance value rx-buffer-vaddr \ virtual address for RX buffer (34320 bytes)
 	0 instance value rx-buffer-baddr \ bus address for RX buffer (34320 bytes)
-	0 instance value mac-buffer-addr \ address of 8-byte buffer to store MAC address (this feels silly but done in the interest of expediency to get an address that will work with encode-bytes) 
+	6 instance buffer: mac-buffer \ buffer to store MAC address
 	0 instance value last-rx-wrap-len \ the number of bytes past the nominal length of the RX buffer the last received packet overran. Used to compute offset of next packet from top of RX buffer. See datasheet pp17 for WRAP behavior.
 	0 instance value obp-tftp \ ihandle of TFTP boot package
+	
+	\ TX descriptors
+	4 cells instance buffer: tx-descriptor-vaddrs
+	4 cells instance buffer: tx-descriptor-baddrs
+	\ Register offsets for descriptor status and start
+	\ Used to compute the register offsets for all 4 descriptors
+	10 constant tx-d0-status
+	20 constant tx-d0-start
+
+	\ keep track of which TX descriptor is up to be used next
+	0 instance value next-tx-descriptor
+	0 instance value next-tx-descriptor-vaddr
+	0 instance value next-tx-descriptor-baddr
+	tx-d0-status instance value next-tx-descriptor-status-reg
+
 
 	\ Read RTL8139 operational register (1 byte)
 	: reg-read	( reg offset -- 1 byte of data from that offset )
@@ -101,29 +112,31 @@ fcode-version3
 	;
 
 	\ Basic setup for TX operation (DMA allocation, transmit configuration)
-	: setup-tx
-		\ Enable transmit state machine (datasheet pp12 command register)
-		command-register reg-read 4 or command-register reg-write
-		\ Allocate DMA memory for Tx Descriptor 0 (we will only support utilizing one Tx descriptor at a time)
-		\ This is not allowed to be more than 1792 bytes and we will probably be sending regular 1500 byte packets at max anyway
-		\ 1600 bytes should be fine
-		tx-descriptor-len " dma-alloc" $call-parent to tx-descriptor-vaddr \ Allocate 1600 bytes of memory for DMA
-
-		\ Program start bus address into Tx Start Address Desc 0 register (0x20-0x23 4-byte write)
-		\ Obtain and store bus address
-		tx-descriptor-vaddr tx-descriptor-len false " dma-map-in" $call-parent to tx-descriptor-baddr
-		\ Program Tx Start Address Desc 0 register with bus address
-		tx-descriptor-baddr tx-descriptor-0-start-reg reg-write4
+	: setup-tx ( -- )
+		\ Allocate DMA memory for TX descriptors, map the DMA, and program into device registers
+		4 0 do
+			tx-descriptor-len " dma-alloc" $call-parent dup dup \ allocate memory for this descriptor ( vaddr, vaddr, vaddr )
+			tx-descriptor-len erase \ zero allocated memory ( vaddr, vaddr )
+			i cells tx-descriptor-vaddrs + l! \ compute offset into TX descriptor vaddrs buffer and store (assumes 32-bit address) ( vaddr )
+			tx-descriptor-len false " dma-map-in" $call-parent dup ( baddr, baddr )
+			i cells tx-descriptor-baddrs + l! \ compute offset into TX descriptor baddrs buffer and store (assumes 32-bit address) ( baddr )
+			tx-d0-start i 4 * + reg-write4 \ program bus address into the correct register (compute by multiplying i*4)
+		loop
 
 		\ Set DMA burst size in Transmit Configuration Register
 		\ Also make sure 1,1 are set for interframe gap time since any other value violates the spec
 		3000600 tx-config-reg reg-write4
+
+		\ Enable transmit state machine (datasheet pp12 command register)
+		command-register reg-read 4 or command-register reg-write
+
+		\ Initial state for next TX descriptor
+		tx-descriptor-vaddrs l@ to next-tx-descriptor-vaddr
+		tx-descriptor-baddrs l@ to next-tx-descriptor-baddr
 	;
 
 	\ Basic setup for RX operation (DMA allocation, receive configuration)
-	: setup-rx
-		\ Enable receive state machine (datasheet pp12 command register)
-		command-register reg-read 8 or command-register reg-write
+	: setup-rx ( -- )
 		\ Allocate DMA memory for Rx buffer
 		\ Rx buffer will be 32K but we want to use wrapping. Total size will be 32K + 16 byte + 1536 bytes = 0x8610 bytes (34320 bytes)
 		rx-buffer-len " dma-alloc" $call-parent to rx-buffer-vaddr
@@ -155,17 +168,19 @@ fcode-version3
 
 		\ Reset CAPR (current address of packet read) register (0x38 2 byte register)
 		0 capr-reg reg-write2
+
+		\ Enable receive state machine (datasheet pp12 command register)
+		command-register reg-read 8 or command-register reg-write
 	;
 
 	\ Read the MAC address from the device and expose the mac-address property required by Open Firmware for network devices
 	: setup-mac-addr ( -- )
-		8 alloc-mem to mac-buffer-addr \ Allocate 8 bytes for MAC address buffer (we need this for encode-bytes)
 		0 reg-read4 \ read first 4 bytes of MAC address
-		mac-buffer-addr rl! \ store these 4 bytes to the first 4 bytes of the buffer
+		mac-buffer rl! \ store these 4 bytes to the first 4 bytes of the buffer
 		4 reg-read2 \ read last 2 bytes of MAC address
-		mac-buffer-addr 4 + rw! \ store these 2 bytes to the last 2 bytes of the buffer
-		mac-buffer-addr 6 encode-bytes " mac-address" property \ expose mac-address property with encoded bytes
-		mac-buffer-addr 6 encode-bytes " local-mac-address" property \ expose local-mac-address property as well (optional)
+		mac-buffer 4 + rw! \ store these 2 bytes to the last 2 bytes of the buffer
+		mac-buffer 6 encode-bytes " mac-address" property \ expose mac-address property with encoded bytes
+		mac-buffer 6 encode-bytes " local-mac-address" property \ expose local-mac-address property as well (optional)
 	;
 
 	\ TFTP init copied from Sun driver example
@@ -186,12 +201,14 @@ fcode-version3
 		op-regs-base op-regs-len " map-out" $call-parent
 		\ Disable memory space access and bus mastering
 		0 my-space 04 + " config-w!" $call-parent \ write 0 to command register (04)
-		\ Unmap and free DMA memory
-		tx-descriptor-baddr tx-descriptor-len " dma-map-out" $call-parent \ unmap DMA
-		tx-descriptor-vaddr tx-descriptor-len " dma-free" $call-parent 
+		\ Unmap and free DMA memory for TX descriptors
+		4 0 do
+			tx-descriptor-baddrs i cells + l@ tx-descriptor-len " dma-map-out" $call-parent \ Unmap DMA for this bus address
+			tx-descriptor-vaddrs i cells + l@ tx-descriptor-len " dma-free" $call-parent \ Free the allocated buffer
+		loop
+		\ Unmap and free Rx buffer
 		rx-buffer-baddr rx-buffer-len " dma-map-out" $call-parent
 		rx-buffer-vaddr rx-buffer-len " dma-free" $call-parent 
-		mac-buffer-addr 8 free-mem \ MAC buffer
 
 		obp-tftp ?dup if close-package then
 	;
@@ -245,6 +262,18 @@ fcode-version3
 		true
 	;
 
+	\ Increment the next Tx descriptor to be used
+	: incr-tx-descriptor
+		\ Increment index
+		next-tx-descriptor 1 + 4 mod to next-tx-descriptor
+		\ Increment vaddr
+		tx-descriptor-vaddrs next-tx-descriptor cells + l@ to next-tx-descriptor-vaddr
+		\ Increment baddr
+		tx-descriptor-baddrs next-tx-descriptor cells + l@ to next-tx-descriptor-baddr
+		\ Increment next status register
+		next-tx-descriptor 4 * tx-d0-status + to next-tx-descriptor-status-reg
+	;
+
 	\ Open Firmware standard write method for network device, returns actual number of bytes written
 	\ Packet must be complete with all addressing information, including source hardware address
 	: write ( src-addr len -- actual )
@@ -253,42 +282,48 @@ fcode-version3
 			0 exit \ Return 0 bytes actually written
 		then
 
+		." Begin TX with descriptor " next-tx-descriptor .h cr
+		." Status reg is " next-tx-descriptor-status-reg .h cr
 		." TSAD " tsad-reg reg-read2 .h cr
 
 		\ 1. (src-addr, len, len) 2. (len, len, src-addr) 3. (len, len, src-addr, dest-addr) 4. (len, src-addr, dest-addr, len)
-		dup rot tx-descriptor-vaddr rot \ make the arguments how we need for the move
+		dup rot next-tx-descriptor-vaddr rot \ make the arguments how we need for the move
 		\ Copy the memory into the Tx descriptor
 		move \ perform the memory copy, stack is now (len)
 
 		\ Flush caches for DMA
-		tx-descriptor-vaddr tx-descriptor-baddr tx-descriptor-len my-dma-sync
+		next-tx-descriptor-vaddr next-tx-descriptor-baddr tx-descriptor-len my-dma-sync
 
 		\ Tell the device the size and give it the ownership of the TX buffer (one operation)
 		dup ( len, len )
 		\ use reg-write4 per datasheet "these registers are only permitted to write by double-word access"
-		tx-descriptor-0-status-reg reg-write4 \ write data to TX descriptor 0 register. This is the size and then we also set OWN bit to 0, handing ownership of the buffer to the device
+		next-tx-descriptor-status-reg reg-write4 \ write data to TX descriptor status register. This is the size and then we also set OWN bit to 0, handing ownership of the buffer to the device
 		\ stack is now (len), 
 
 		\ Check bit 15 for TX completion
 		\ Completion must happen within 10ms
 		tx-delay-ms 0 do
 			1 ms \ delay
-			tx-descriptor-0-status-reg reg-read2 8000 and \ check bit 15
+			next-tx-descriptor-status-reg reg-read2 8000 and \ check bit 15
 			0 > if leave then \ exit loop early if bit 15 is set (result is greater than 0)
 		loop
 
 		\ Verify we have completion
-		tx-descriptor-0-status-reg reg-read2 8000 and
+		next-tx-descriptor-status-reg reg-read2 8000 and
 		0 > if
 			." Transmitted packet." cr
-			." TX Status reg " tx-descriptor-0-status-reg reg-read2 .h cr
+			." TX Status reg " next-tx-descriptor-status-reg reg-read2 .h cr
 			." ISR " isr-reg reg-read2 .h cr
 			." TSAD " tsad-reg reg-read2 .h cr
+			." End TX for descriptor " next-tx-descriptor .h ." , incrementing" cr
+			incr-tx-descriptor
 		else
 			." Packet did not transmit in time!" cr
-			\ Output tx descriptor 0 status reg for debug purposes
-			." TX Status reg " tx-descriptor-0-status-reg reg-read2 .h cr
+			\ Output tx descriptor status reg for debug purposes
+			." TX Status reg " next-tx-descriptor-status-reg reg-read2 .h cr
 			." TSAD " tsad-reg reg-read2 .h cr
+			." End TX for descriptor " next-tx-descriptor .h ." , incrementing" cr
+			incr-tx-descriptor
 			drop 0 exit \ drop full packet len, replace with 0, return
 		then
 
