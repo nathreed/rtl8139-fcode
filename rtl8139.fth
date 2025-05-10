@@ -20,6 +20,7 @@ fcode-version3
 	3a constant cbr-reg \ Current Buffer Address (where the device is writing in the RX buffer. 2-byte register)
 	rx-buffer-len d# 1536 - constant rx-buffer-nominal-len \ Nominal length of RX buffer (ignoring 1.5K allocated for wrap overrun). Used to determine overrun amount for handling wrap behavior.
 	3e constant isr-reg \ 2 byte register interrupt status
+	3c constant imr-reg \ 2 byte register interrupt mask
 	40 constant tx-config-reg \ 4 byte register, transmit configuration register (datasheet pp.14-15)
 	60 constant tsad-reg \ transmit status of all descriptors, 2-byte register (datasheet pp.24)
 
@@ -151,8 +152,8 @@ fcode-version3
 		rx-buffer-baddr rx-buffer-reg reg-write4
 
 		\ Set early Rx thresholds, Rx buffer length, and wrap mode in Receive Configuration Register (datasheet pp16)
-		\ RCR contents will be 0xF692
-		\ no early RX threshold,
+		\ RCR contents will be 0xF00F692
+		\ 15/16 early RX threshold,
 		\ no multiple early interrupt,
 		\ only accept 64-byte error packets,
 		\ Rx FIFO threshold none (DMA when whole packet received),
@@ -161,13 +162,11 @@ fcode-version3
 		\ wrap mode enabled,
 		\ do not accept error,
 		\ accept runt packets,
-		\ do not accept broadcast or multicast packets,
+		\ do not accept broadcast packets,
+		\ do not accept multicast packets,
 		\ accept physical match,
 		\ do not accept all packets)
-		F692 recv-config-reg reg-write4 \ RCR is 0x44-0x47 4 byte register
-
-		\ Reset CAPR (current address of packet read) register (0x38 2 byte register)
-		0 capr-reg reg-write2
+		F00F692 recv-config-reg reg-write4 \ RCR is 0x44-0x47 4 byte register
 
 		\ Enable receive state machine (datasheet pp12 command register)
 		command-register reg-read 8 or command-register reg-write
@@ -256,8 +255,6 @@ fcode-version3
 		\ obp-tftp init for booting
 		init-obp-tftp 0= if close false exit then
 
-		." TSAD " tsad-reg reg-read2 .h cr
-
 		\ return true for successful open
 		true
 	;
@@ -330,68 +327,82 @@ fcode-version3
 		\ len is still on the stack; we return it because we have written the whole thing.
 	;
 
+	\ Returns offset to use for RX buffer reading, accounting for the 16 bytes mysteriously subtracted from CAPR when it is read
+	: rx-read-offset ( -- offset to read from in RX buffer )
+		capr-reg reg-read2 10 + 
+	;
+
 	\ Open Firmware standard read method for network device
 	\ Returns actual number of bytes received or -2 if no packet is currently available
 	: read ( addr len -- retval )
-		\ If CAPR != CBR, there is a packet ready for us to receive, if not, there is no packet
-		capr-reg reg-read2 cbr-reg reg-read2 = if
+		." PACKET READ METHOD" cr
+		." CAPR " capr-reg reg-read2 .h cr
+		." CBR " cbr-reg reg-read2 .h cr
+		." RX_ER counter (packets recv since last check) " 72 reg-read2 .h cr
+		." ISR " isr-reg reg-read2 .h cr
+		." Cmd register " command-register reg-read .h cr
+		\ If the command register bit 1 is set, the buffer is empty and there is no packet stored
+		command-register reg-read 1 and 1 = if
 			." No packet available" cr
 			2drop \ remove addr and len arguments from stack
+			\ Check for RX overflow state and clear it
+			isr-reg reg-read2 50 and 0 > if
+				\ At least one of Rx Buffer Overflow or RX FIFO overflow is active
+				\ Per programming guide, we are recommended to clear all of them
+				\ This is not handled at this time
+				." At least one overflow interrupt is active, this is currently unhandled, RX is stopped, possible corruption! " isr-reg reg-read2 .h cr
+			then
 			-2 exit \ return -2 for no packet available
 		then
 
-		\ Determine the length of the packet
-		\ We start by fetching the 2-byte value from the Ethernet frame header that is either the length or the EtherType
-		capr-reg reg-read2 \ Get the offset into the RX buffer where the next packet starts
-		dup \ Save CAPR value for use when handling length, stack is now (addr, len, capr value, capr value)
-		rx-buffer-vaddr + c + w@ \ Fetch the 2-byte value from the RX buffer start address offset by the CAPR value + 12 for offset of length field
-		\ stack is now (addr, len, capr value, ethernet frame length)
-		dup d# 1536 < if ( addr, len, capr value, ethernet frame length )
-			\ This is a length value
-			\ Compute and save overrun amount (if any)
-			dup rot \ Save frame length for use after if statement ( addr, len, ethernet frame length, capr value, ethernet frame length )
-			+ ( addr, len, ethernet frame length, offset of first byte past end of packet )
-			rx-buffer-nominal-len - \ compute end offset - nominal length = overrun amount ( addr, len, frame length, overrun amount)
-			0 max \ Compute overrun amount, negative overrun means we did not overrun so we clamp to 0
-			dup ." Overrun is " s. cr
-			to last-rx-wrap-len \ ( addr, len, frame length ) - NOTE that in theory we could have this on the stack since we only use it later on in this function but that makes the stack a lot more complex
-		else
-			\ This is an EtherType value
-			." EtherType packet RX not yet implemented, EtherType bytes: " dup .h cr
-			0800 = if
-				." IPv4 EtherType" cr
-			else 0806 = if
-				." ARP EtherType" cr then
-			then
-		then
-
-		\ Flush caches for DMA before we read
+		\ DMA sync before we read
 		rx-buffer-vaddr rx-buffer-baddr rx-buffer-len my-dma-sync
 
-		\ Now we know the length
-		\ Copy the bytes the caller has requested. Ensure we only copy the lesser of what was requested and what we have available.
-		\ Stack is currently ( addr, len, frame length )
-		min \ take min of len and frame length, stack is now ( addr, length to transfer )
-		\ Starting address of the ethernet frame (previously we added 12 to get the length field)
-		capr-reg reg-read2 rx-buffer-vaddr + w@ rot ( src_addr, dest_addr, length to transfer )
-		dup rot swap 3 pick rot swap ( src, length to transfer , src, dest, length to transfer )
-		move \ do the copy
-		nip \ remove extra src ( length to transfer )
+		\ There is a 32 bit header on the packet in the RX buffer
+		\ The first 16 bits are the size of the packet and the last 16 bits are the "Receive Status Register in Rx Packet Header" per datasheet pp.10
+		\ stack is currently ( addr length to read )
 
-		\ Set CAPR to reflect that we processed the packet we know about
-		last-rx-wrap-len 0 > if
-			\ We had an overrun, new CAPR is beginning of buffer + overrun amount
-			rx-buffer-vaddr last-rx-wrap-len + capr-reg reg-write2 ( length to transfer )
-			\ overrun amount will be reset next time we read
+		\ read packet length
+		rx-read-offset rx-buffer-vaddr + w@ ( dest addr, length to read, packet length )
+		\ Before we continue, we need to check if this packet is still in progress
+		\ FreeBSD driver says if length is 0xfff0 this packet is not yet valid
+		dup FFF0 = if
+			." Found packet but it's not done DMA yet, not able to read it!" cr
+			3drop \ remove dest addr, length to read, packet length
+			-2 exit
+		then
+		\ Per the programming guide there is a 4 byte CRC on the end of the packet, we don't want to copy that to our caller
+		4 - ( dest addr, length client wants, packet length less CRC )
+		\ we will read the lesser of the packet length or the length the caller wants
+		min ( addr, length we will actually read )
+
+		\ obtain source address for memory copy: RX buffer + CAPR + 4 bytes
+		rx-read-offset rx-buffer-vaddr + 4 + rot ( src addr, dest addr, length we will read )
+		dup rot 3 pick rot ( src addr, length we will read, src addr, dest addr, length we will read )
+		move \ do the copy
+		nip \ remove extra src ( length we read )
+
+		\ Set CAPR to reflect we read this packet
+		\ We need to detect if this packet was in the wrap area "past" the end of the buffer
+		rx-read-offset rx-buffer-vaddr + w@ ( length we read, packet length )
+		dup dup rx-read-offset + rx-buffer-nominal-len - dup 0 >= if ( length we read, packet length, overrun/wrap amount )
+			\ Packet length caused us to exceed buffer
+			\ CAPR = 0 + overrun amount + alignment stuff
+			." Packet length wrapped 0x" dup .h ."  bytes past nominal end of buffer, compensating." cr
+			nip \ we don't care about packet length in this case
+			4 + 3 + 3 invert and \ overrun amount is the base for new CAPR, + 4 for header + 3 for alignment, then AND with ~3 for alignment mask
+			10 - capr-reg reg-write2 \ Update CAPR, subtract 0x10 for some odd reason (programming guide says "avoid overflow")
+			." RX done, CAPR = 0x" capr-reg reg-read2 .h cr 
 		else
-			\ New CAPR is old CAPR plus frame length
-			\ Note we have to read frame length from memory again because the length we have on the stack now is the length to transfer
-			\ If client requested less we wouldn't advance CAPR by enough.
-			capr-reg reg-read2 rx-buffer-vaddr + c + w@ \ read frame length from beginning of frame (length to transfer, full frame length)
-			capr-reg reg-read2 + capr-reg reg-write2 \ add full frame length to current CAPR value and return ( length to transfer)
+			\ we didn't overrun so we don't care about overrun amount
+			drop ( length we read, packet length )
+			\ CAPR = CAPR + packet length + alignment stuff
+			rx-read-offset + 4 + 3 + 3 invert and \ CAPR + packet length + 4 for header + 3 for alignment, then AND with ~3 for alignment mask
+			10 - capr-reg reg-write2 \ Update CAPR, subtract 0x10 to avoid overflow
+			." RX done, CAPR = 0x" capr-reg reg-read2 .h cr 
 		then
 
-		\ Stack is still (length actually received)
+		\ Stack is now ( length we read )
 		\ Return out the length actually received
 	;
 
