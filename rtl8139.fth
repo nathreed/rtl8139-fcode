@@ -151,8 +151,11 @@ fcode-version3
 		\ Tell device about it (register 0x30-0x33 4 byte address)
 		rx-buffer-baddr rx-buffer-reg reg-write4
 
+		\ Enable receive state machine (datasheet pp12 command register)
+		command-register reg-read 8 or command-register reg-write
+
 		\ Set early Rx thresholds, Rx buffer length, and wrap mode in Receive Configuration Register (datasheet pp16)
-		\ RCR contents will be 0xF00F692
+		\ RCR contents will be 0xF00F69A
 		\ 15/16 early RX threshold,
 		\ no multiple early interrupt,
 		\ only accept 64-byte error packets,
@@ -162,14 +165,11 @@ fcode-version3
 		\ wrap mode enabled,
 		\ do not accept error,
 		\ accept runt packets,
-		\ do not accept broadcast packets,
+		\ accept broadcast packets,
 		\ do not accept multicast packets,
 		\ accept physical match,
 		\ do not accept all packets)
-		F00F692 recv-config-reg reg-write4 \ RCR is 0x44-0x47 4 byte register
-
-		\ Enable receive state machine (datasheet pp12 command register)
-		command-register reg-read 8 or command-register reg-write
+		F00F69A recv-config-reg reg-write4 \ RCR is 0x44-0x47 4 byte register
 	;
 
 	\ Read the MAC address from the device and expose the mac-address property required by Open Firmware for network devices
@@ -327,20 +327,27 @@ fcode-version3
 		\ len is still on the stack; we return it because we have written the whole thing.
 	;
 
-	\ Returns offset to use for RX buffer reading, accounting for the 16 bytes mysteriously subtracted from CAPR when it is read
+	\ Returns offset to use for RX buffer reading, accounting for the 16 bytes subtracted from CAPR when it is written
 	: rx-read-offset ( -- offset to read from in RX buffer )
-		capr-reg reg-read2 10 + 
+		\ We add 16 bytes here
+		\ This is because the initial value of CAPR is 0xFFF0, 16 bytes below the max. 
+		\ This is because you're intended to add 16 bytes to your CAPR when you read it out before you use it.
+		\ Adding 16 bytes corresponds to an offset of 0 into the RX buffer (because the addition overflows/wraps)
+
+		\ The Forth addition does not overflow here so we have to mod to pretend like it does
+		capr-reg reg-read2 10 + 10000 mod
 	;
 
 	\ Open Firmware standard read method for network device
 	\ Returns actual number of bytes received or -2 if no packet is currently available
 	: read ( addr len -- retval )
-		." PACKET READ METHOD" cr
+		." PACKET READ METHOD stack is " .s cr
 		." CAPR " capr-reg reg-read2 .h cr
 		." CBR " cbr-reg reg-read2 .h cr
 		." RX_ER counter (packets recv since last check) " 72 reg-read2 .h cr
 		." ISR " isr-reg reg-read2 .h cr
 		." Cmd register " command-register reg-read .h cr
+		." RCR " recv-config-reg reg-read4 .h cr
 		\ If the command register bit 1 is set, the buffer is empty and there is no packet stored
 		command-register reg-read 1 and 1 = if
 			." No packet available" cr
@@ -371,39 +378,59 @@ fcode-version3
 			3drop \ remove dest addr, length to read, packet length
 			-2 exit
 		then
+
+		( dest addr, length to read, packet length )
+
+		dup ." Initial RX of packet with length " .h ." stack is " .s cr
 		\ Per the programming guide there is a 4 byte CRC on the end of the packet, we don't want to copy that to our caller
 		4 - ( dest addr, length client wants, packet length less CRC )
 		\ we will read the lesser of the packet length or the length the caller wants
 		min ( addr, length we will actually read )
+		dup ." After min we will actually read length: " .h ." stack is " .s cr
 
-		\ obtain source address for memory copy: RX buffer + CAPR + 4 bytes
-		rx-read-offset rx-buffer-vaddr + 4 + rot ( src addr, dest addr, length we will read )
-		dup rot 3 pick rot ( src addr, length we will read, src addr, dest addr, length we will read )
-		move \ do the copy
+		\ obtain source address for memory copy: RX buffer + RX read offset + 4 bytes (skip header)
+		rx-read-offset ( addr, read len, rx read offset ) rx-buffer-vaddr ( addr, read len, rx read offset, rx buffer vaddr ) + ( addr, read len, absolute read address )
+		dup ." Absolute rx buffer address " .h ."  stack is " .s cr
+		4 ( addr, read len, absolute read address, 4 ) + ( dest addr, length we will read, src addr ) 
+		dup ." Offset by 4 (src addr) " .h ."  stack is " .s cr
+		-rot ( src addr, dest addr, length we will read )
+
+
+		dup ." Pre crazy line length we will read: " .h ."  stack is " .s cr
+		dup ( src addr, dest addr, length we will read, length we will read ) -rot ( src addr, length we will read, dest addr, length we will read ) 3 pick ( src addr, length we will read, dest addr, length we will read, src addr ) -rot ( src addr, length we will read, src addr, dest addr, length we will read )
+		dup ." Pre copy length we will read: " .h cr
+		move \ do the copy ( src addr, length we read )
 		nip \ remove extra src ( length we read )
+		dup ." Post copy length we read: " .h cr
 
 		\ Set CAPR to reflect we read this packet
 		\ We need to detect if this packet was in the wrap area "past" the end of the buffer
+
+		\ First read the length of the packet again
 		rx-read-offset rx-buffer-vaddr + w@ ( length we read, packet length )
-		dup dup rx-read-offset + rx-buffer-nominal-len - dup 0 >= if ( length we read, packet length, overrun/wrap amount )
+		2dup ." Pre wrap check packet len " .h ."  and length we read: " .h cr
+		dup rx-read-offset + rx-buffer-nominal-len - dup 0 >= if ( length we read, packet length, overrun/wrap amount )
 			\ Packet length caused us to exceed buffer
 			\ CAPR = 0 + overrun amount + alignment stuff
 			." Packet length wrapped 0x" dup .h ."  bytes past nominal end of buffer, compensating." cr
 			nip \ we don't care about packet length in this case
 			4 + 3 + 3 invert and \ overrun amount is the base for new CAPR, + 4 for header + 3 for alignment, then AND with ~3 for alignment mask
-			10 - capr-reg reg-write2 \ Update CAPR, subtract 0x10 for some odd reason (programming guide says "avoid overflow")
+			10 - capr-reg reg-write2 \ Update CAPR, CAPR is always 16 less than the actual value because its initial value is 0xFFF0 corresponding to 0 in the buffer
 			." RX done, CAPR = 0x" capr-reg reg-read2 .h cr 
 		else
 			\ we didn't overrun so we don't care about overrun amount
 			drop ( length we read, packet length )
+			2dup ." Received packet with length " .h ."  and read length: " .h cr
+			." RX read offset " rx-read-offset .h cr
 			\ CAPR = CAPR + packet length + alignment stuff
 			rx-read-offset + 4 + 3 + 3 invert and \ CAPR + packet length + 4 for header + 3 for alignment, then AND with ~3 for alignment mask
-			10 - capr-reg reg-write2 \ Update CAPR, subtract 0x10 to avoid overflow
+			10 - capr-reg reg-write2 \ Update CAPR, subtract 16
 			." RX done, CAPR = 0x" capr-reg reg-read2 .h cr 
 		then
 
 		\ Stack is now ( length we read )
 		\ Return out the length actually received
+		dup ." RX return we read length " .h cr
 	;
 
 	\ Open Firmware standard load function for bootable network device
