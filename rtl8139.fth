@@ -155,8 +155,8 @@ fcode-version3
 		command-register reg-read 8 or command-register reg-write
 
 		\ Set early Rx thresholds, Rx buffer length, and wrap mode in Receive Configuration Register (datasheet pp16)
-		\ RCR contents will be 0xF00F69A
-		\ 15/16 early RX threshold,
+		\ RCR contents will be 0xF69A
+		\ no early RX threshold,
 		\ no multiple early interrupt,
 		\ only accept 64-byte error packets,
 		\ Rx FIFO threshold none (DMA when whole packet received),
@@ -169,7 +169,7 @@ fcode-version3
 		\ do not accept multicast packets,
 		\ accept physical match,
 		\ do not accept all packets)
-		F00F69A recv-config-reg reg-write4 \ RCR is 0x44-0x47 4 byte register
+		F69A recv-config-reg reg-write4 \ RCR is 0x44-0x47 4 byte register
 	;
 
 	\ Read the MAC address from the device and expose the mac-address property required by Open Firmware for network devices
@@ -335,7 +335,8 @@ fcode-version3
 		\ Adding 16 bytes corresponds to an offset of 0 into the RX buffer (because the addition overflows/wraps)
 
 		\ The Forth addition does not overflow here so we have to mod to pretend like it does
-		capr-reg reg-read2 10 + 10000 mod
+		\ double mod: one for 16-bit addition overflow, other for buffer size
+		capr-reg reg-read2 10 + 10000 mod rx-buffer-nominal-len mod 
 	;
 
 	\ Open Firmware standard read method for network device
@@ -344,13 +345,12 @@ fcode-version3
 		." PACKET READ METHOD stack is " .s cr
 		." CAPR " capr-reg reg-read2 .h cr
 		." CBR " cbr-reg reg-read2 .h cr
-		." RX_ER counter (packets recv since last check) " 72 reg-read2 .h cr
 		." ISR " isr-reg reg-read2 .h cr
 		." Cmd register " command-register reg-read .h cr
 		." RCR " recv-config-reg reg-read4 .h cr
 		\ If the command register bit 1 is set, the buffer is empty and there is no packet stored
 		command-register reg-read 1 and 1 = if
-			." No packet available" cr
+			." No packet available, BUFE set" cr
 			2drop \ remove addr and len arguments from stack
 			\ Check for RX overflow state and clear it
 			isr-reg reg-read2 50 and 0 > if
@@ -362,12 +362,30 @@ fcode-version3
 			-2 exit \ return -2 for no packet available
 		then
 
+		\ Check for ROK condition in ISR, if this is not set then the packet is not done with DMA copy yet even though the "buffer empty" bit is not cleared
+		isr-reg reg-read2 1 and 0 = if
+			\ ROK is not set, the packet is not ready yet
+			." No packet available, ROK not set" cr
+			." ISR " isr-reg reg-read2 .h cr
+			2drop
+			-2 exit
+		 then
+
 		\ DMA sync before we read
 		rx-buffer-vaddr rx-buffer-baddr rx-buffer-len my-dma-sync
 
 		\ There is a 32 bit header on the packet in the RX buffer
 		\ The first 16 bits are the size of the packet and the last 16 bits are the "Receive Status Register in Rx Packet Header" per datasheet pp.10
 		\ stack is currently ( addr length to read )
+
+		\ The header is little endian
+		\ The easiest thing to do is to flip it in place, since lbflips operates on a memory location, not a stack value
+		\ The device has already handed us ownership of the buffer (except for the 0xFFF0 check below...) so this *should* not be a problem
+		rx-read-offset rx-buffer-vaddr + 4 lbflips
+
+		\ Log entire 32-bit header
+		rx-read-offset rx-buffer-vaddr + l@
+		." RX packet header " .h cr 
 
 		\ read packet length
 		rx-read-offset rx-buffer-vaddr + w@ ( dest addr, length to read, packet length )
@@ -380,6 +398,28 @@ fcode-version3
 		then
 
 		( dest addr, length to read, packet length )
+
+		\ Check to make sure we aren't reading a packet before CBR has been updated, indicating it's ready to read
+		\ The ordering of the steps in the programmer's guide implies this should be impossible (BUFE and ROK are only set after packet is fully copied) but observing this case is hit in practice
+		\ FreeBSD driver does a check like this 
+		cbr-reg reg-read2 rx-buffer-nominal-len mod ( dest addr, length to read, packet length, CBR limit )
+		dup rx-read-offset < if ( dest addr, length to read, packet length, CBR limit )
+			rx-buffer-nominal-len rx-read-offset - + ( dest addr, length to read, packet length, max bytes we can read )
+		else
+			rx-read-offset - ( dest addr, length to read, packet length, max bytes we can read )
+		then
+		over 4 + swap > if ( dest addr, length to read, packet length )
+			." No packet available, CBR not far enough forward yet" cr
+			3drop
+			-2 exit
+		then
+
+		( dest addr, length to read, packet length )
+
+		\ Done with all checks, we are for sure going to handle this packet now.
+		\ Clear RX interrupt
+		\ isr-reg reg-read2 1 or isr-reg reg-write2
+		." Proceed RX, ISR = " isr-reg reg-read2 .h cr
 
 		dup ." Initial RX of packet with length " .h ." stack is " .s cr
 		\ Per the programming guide there is a 4 byte CRC on the end of the packet, we don't want to copy that to our caller
@@ -422,7 +462,7 @@ fcode-version3
 			drop ( length we read, packet length )
 			2dup ." Received packet with length " .h ."  and read length: " .h cr
 			." RX read offset " rx-read-offset .h cr
-			\ CAPR = CAPR + packet length + alignment stuff
+			\ RxReadOffset = RxReadOffset + packet length + alignment stuff
 			rx-read-offset + 4 + 3 + 3 invert and \ CAPR + packet length + 4 for header + 3 for alignment, then AND with ~3 for alignment mask
 			10 - capr-reg reg-write2 \ Update CAPR, subtract 16
 			." RX done, CAPR = 0x" capr-reg reg-read2 .h cr 
