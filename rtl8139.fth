@@ -282,6 +282,23 @@ fcode-version3
 		." Begin TX with descriptor " next-tx-descriptor .h cr
 		." Status reg is " next-tx-descriptor-status-reg .h cr
 		." TSAD " tsad-reg reg-read2 .h cr
+		." TX src addr " over .h cr
+
+		\ Check if the provided packet is too small
+		\ A size of 64 bytes works here, and 56 bytes did not (that was my first guess for 42 byte min payload + 14 byte ethernet header)
+		dup d# 64 swap - dup 0 > if ( src-addr, len, amount below minimum 64 bytes )
+			\ Provided packet length is less than 64 byte minimum, this will not be a valid packet if we send as is
+			over + ( src-addr, original len, new len )
+			alloc-mem ( src-addr, original len, new buffer address )
+			dup d# 64 erase \ Zero allocated memory
+			dup >r swap \ Stash a copy of new buffer address on the return stack temporarily (src-addr, new addr, original len ) and ( new addr )
+			move \ Do the copy
+			r> d# 64 \ Stack is now (new-src-addr, new-len which is 64 )  
+			." Packet was smaller than minimum, adjusted" cr
+		else
+			\ Provided packet length meets minimum, drop the negative delta and continue
+			drop
+		then
 
 		\ 1. (src-addr, len, len) 2. (len, len, src-addr) 3. (len, len, src-addr, dest-addr) 4. (len, src-addr, dest-addr, len)
 		dup rot next-tx-descriptor-vaddr rot \ make the arguments how we need for the move
@@ -454,7 +471,7 @@ fcode-version3
 			\ CAPR = 0 + overrun amount + alignment stuff
 			." Packet length wrapped 0x" dup .h ."  bytes past nominal end of buffer, compensating." cr
 			nip \ we don't care about packet length in this case
-			4 + 3 + 3 invert and \ overrun amount is the base for new CAPR, + 4 for header + 3 for alignment, then AND with ~3 for alignment mask
+			4 + 3 + 3 invert and \ overrun amount is the base for new read offset, then + 4 for header + 3 for alignment, then AND with ~3 for alignment mask
 			10 - capr-reg reg-write2 \ Update CAPR, CAPR is always 16 less than the actual value because its initial value is 0xFFF0 corresponding to 0 in the buffer
 			." RX done, CAPR = 0x" capr-reg reg-read2 .h cr 
 		else
