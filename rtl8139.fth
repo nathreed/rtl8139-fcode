@@ -358,20 +358,30 @@ fcode-version3
 
 	: set-rx-read-offset ( offset to set -- )
 		3 + 3 invert and \ +3 then AND with ~3 for alignment
+		rx-buffer-nominal-len 10 - mod \ Need to do the mod, this is so something like 0x8010 turns into 0x0 so that on the next step we subtract 0x16 and get 0xfff0
 		10 - ffff and \ Truncate to 16 bit, if we went negative 2s complement will save us
 		capr-reg reg-write2 \ write CAPR
 	;
 
-	\ Dump the first 256 bytes of the RX memory buffer to the console so we can observe what changed
+	\ Dump 256 bytes starting from the given offset in the RX buffer
 	\ 8 bytes per line and it shows the starting offset of each line like hexdump
-	: debug-dump-buffer ( -- )
+	: debug-dump-buffer ( offset -- )
+		." ******START DUMP*******" cr 
 		d# 32 0 do
-			." 0x" i 8 * .h ." :" 
-			rx-buffer-vaddr i 8 * + l@ .h \ First 4 bytes, i*8
-			rx-buffer-vaddr i 8 * 4 + + l@ .h \ Second 4 bytes, i*8 + 4
+			." 0x" dup i 8 * + .h ." :" 
+			dup rx-buffer-vaddr + i 8 * + l@ .h \ First 4 bytes, i*8
+			dup rx-buffer-vaddr + i 8 * 4 + + l@ .h \ Second 4 bytes, i*8 + 4
 			cr
 		loop
+		drop \ discard offset
+		." ******END DUMP*********" cr
 	;
+
+	0 instance value num-wraps
+	0 instance value should-dump
+	0 instance value wrap-dump-start-offset
+	0 instance value previous-capr
+	0 instance value last-pkt-len
 
 	\ Open Firmware standard read method for network device
 	\ Returns actual number of bytes received or -2 if no packet is currently available
@@ -412,6 +422,10 @@ fcode-version3
 		\ The first 16 bits are the size of the packet and the last 16 bits are the "Receive Status Register in Rx Packet Header" per datasheet pp.10
 		\ stack is currently ( dest_addr, length to read )
 
+		\ TODO / DEBUG
+		rx-read-offset to previous-capr
+
+
 		\ The header is little endian
 		\ The easiest thing to do is to flip it in place, since lbflips operates on a memory location, not a stack value
 		\ The device has already handed us ownership of the buffer (except for the 0xFFF0 check below...) so this *should* not be a problem
@@ -428,6 +442,14 @@ fcode-version3
 		then
 
 		( dest addr, length to read, packet length )
+
+		\ TODO/DEBUG: check for packet length exceeding typical max we see from tcpdump
+		\ this would indicate client is desyncing and reading the wrong field for packet length
+		dup 232 > if
+			." Detected long packet length: " dup .h cr
+		then
+
+		dup to last-pkt-len
 
 		\ Done with all checks, we are for sure going to handle this packet now.
 		\ Clear RX interrupt
@@ -464,6 +486,15 @@ fcode-version3
 			nip \ we don't care about packet length in this case ( length we read, overrun/wrap amount )
 
 			set-rx-read-offset \ Overrun amount is on the stack, this is the base for new CAPR (it already includes the 4 byte header)
+			
+			\ TODO/DEBUG: log the computed start address for the wraparound packet after 42 buffer wraps
+			\ We seem to run into trouble around 45
+			num-wraps 1 + to num-wraps
+			num-wraps d# 46 > if
+				." Wrap: " num-wraps .d ." start address: (0x10 less than real): " rx-read-offset .h cr
+				rx-read-offset 10 - 80 - 0 max to wrap-dump-start-offset \ set start offset for dumps
+				1 to should-dump \ dump the buffer area of interest for the next 2 packets received
+			then
 		else
 			\ we didn't overrun so we don't care about overrun amount
 			drop ( length we read, packet length )
@@ -471,6 +502,16 @@ fcode-version3
 
 			\ Note we STILL NEED the +4 for header here because we're dealing with the packet length, not the overrun amount!
 			rx-read-offset + 4 + set-rx-read-offset \ CAPR + packet length + 4 for header is then new offset, set-rx-read-offset handles the rest
+
+			\ TODO/DEBUG: dump buffer start so we can see if wraps are aligning with what we expect
+			\ should-dump 0 > if
+			\	wrap-dump-start-offset debug-dump-buffer
+			\	should-dump 1 - to should-dump
+			\ then
+		then
+
+		should-dump 0 > if
+			." Previous CAPR " previous-capr .h ." Packet length" last-pkt-len .h ." Next CAPR " rx-read-offset .h cr
 		then
 
 		\ Stack is now ( length we read )
