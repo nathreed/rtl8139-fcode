@@ -5,6 +5,8 @@ fcode-version3
 
 	\ See file for details, Apple Open Firmware broken for map-in
 	fload apple_workaround.fth
+	\ Mac OS 9 runtime driver, needed for second state boot
+	\ fload macos-driver.fth
 
 	\ Constants for RTL8139 driver
 	100 constant op-regs-len
@@ -45,6 +47,12 @@ fcode-version3
 	0 instance value next-tx-descriptor-vaddr
 	0 instance value next-tx-descriptor-baddr
 	tx-d0-status instance value next-tx-descriptor-status-reg
+
+	\ Mac OS driver
+	\ Needs to be read as soon as this FCode is run (i.e. on byte-load), the memory seems to already be clobbered when we get here in open method
+	ac0e buffer: macos-driver-buffer
+	801000 macos-driver-buffer ac0e move
+	cr ." Copied Mac OS driver to own buffer. Beginning of that location: " macos-driver-buffer rl@ .h cr
 
 
 	\ Read RTL8139 operational register (1 byte)
@@ -251,6 +259,7 @@ fcode-version3
 		" ethernet" encode-string " network-type" property
 		" network" encode-string " removable" property
 		" net" encode-string " category" property
+		macos-driver-buffer ac0e encode-bytes " driver,AAPL,MacOS,PowerPC" encode-string property
 
 		\ obp-tftp init for booting
 		init-obp-tftp 0= if close false exit then
