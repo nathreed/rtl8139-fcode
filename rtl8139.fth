@@ -5,8 +5,6 @@ fcode-version3
 
 	\ See file for details, Apple Open Firmware broken for map-in
 	fload apple_workaround.fth
-	\ Mac OS 9 runtime driver, needed for second state boot
-	\ fload macos-driver.fth
 
 	\ Constants for RTL8139 driver
 	100 constant op-regs-len
@@ -53,6 +51,13 @@ fcode-version3
 	ac0e buffer: macos-driver-buffer
 	801000 macos-driver-buffer ac0e move
 	cr ." Copied Mac OS driver to own buffer. Beginning of that location: " macos-driver-buffer rl@ .h cr
+
+	\ TEMP/DEBUG: Set debug property for Mac OS - hardcodes PCI layout from my power mac g4
+	" dev /" evaluate
+	\ 2137 encode-int " AAPL,debug" property \ some extra prints, mostly while copying device tree. Prints warning that EtherPrintf will stop OpenTransport from loading its Ethernet driver even though we're not loading EtherPrintf with this 
+	\ 40000001 encode-int " AAPL,debug" property \ halt after end of FCode (this is right before boot would normally terminate OF and hand control to MacOS - useful for browsing device tree after Trampoline has finished)
+	2020001 encode-int " AAPL,debug" property \ display nanokernel log during boot
+	" dev pci1/@d/@4" evaluate
 
 
 	\ Read RTL8139 operational register (1 byte)
@@ -254,12 +259,16 @@ fcode-version3
 		\ MTU property, 1580 is a somewhat arbitrary value set below 1600 bytes Tx descriptor allocation size
 		mtu encode-int " max-frame-size" property
 
-		" RTL,8139" device-name
+		" pci10ec,8139" device-name
 		" network" device-type
 		" ethernet" encode-string " network-type" property
 		" network" encode-string " removable" property
 		" net" encode-string " category" property
+		" RTL8139 PCI" encode-string " model" property
+		" pci10ec,8139" encode-string " compatible" property
 		macos-driver-buffer ac0e encode-bytes " driver,AAPL,MacOS,PowerPC" encode-string property
+		\ HACK: fcode-rom-offset, is this required for boot?
+		0 encode-int " fcode-rom-offset" property
 
 		\ obp-tftp init for booting
 		init-obp-tftp 0= if close false exit then
@@ -500,9 +509,9 @@ fcode-version3
 			\ We seem to run into trouble around 45
 			num-wraps 1 + to num-wraps
 			num-wraps d# 46 > if
-				." Wrap: " num-wraps .d ." start address: (0x10 less than real): " rx-read-offset .h cr
+				\ ." Wrap: " num-wraps .d ." start address: (0x10 less than real): " rx-read-offset .h cr
 				rx-read-offset 10 - 80 - 0 max to wrap-dump-start-offset \ set start offset for dumps
-				1 to should-dump \ dump the buffer area of interest for the next 2 packets received
+				0 to should-dump \ dump the buffer area of interest for the next 2 packets received
 			then
 		else
 			\ we didn't overrun so we don't care about overrun amount
