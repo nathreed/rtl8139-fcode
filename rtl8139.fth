@@ -48,17 +48,22 @@ fcode-version3
 
 	\ Mac OS driver
 	\ Needs to be read as soon as this FCode is run (i.e. on byte-load), the memory seems to already be clobbered when we get here in open method
-	ac0e buffer: macos-driver-buffer
-	801000 macos-driver-buffer ac0e move
-	cr ." Copied Mac OS driver to own buffer. Beginning of that location: " macos-driver-buffer rl@ .h cr
+	\ ac0e buffer: macos-driver-buffer
+	\ 2001000 macos-driver-buffer ac0e move
+	\ cr ." Copied Mac OS driver to own buffer. Beginning of that location: " macos-driver-buffer rl@ .h cr
 
 	\ TEMP/DEBUG: Set debug property for Mac OS - hardcodes PCI layout from my power mac g4
 	" dev /" evaluate
 	\ 2137 encode-int " AAPL,debug" property \ some extra prints, mostly while copying device tree. Prints warning that EtherPrintf will stop OpenTransport from loading its Ethernet driver even though we're not loading EtherPrintf with this 
 	\ 40000001 encode-int " AAPL,debug" property \ halt after end of FCode (this is right before boot would normally terminate OF and hand control to MacOS - useful for browsing device tree after Trampoline has finished)
 	2020001 encode-int " AAPL,debug" property \ display nanokernel log during boot
-	" dev pci1/@d/@4" evaluate
 
+	\ Debug: Hack a method into obp-tftp that we will use for reading the current block number
+	\ This is used to activate logging past a certain block number
+	" dev /packages/obp-tftp : nr-get-block# tftp-block# ;" evaluate
+
+	\ Take us back to the device where we belong
+	" dev pci1/@d/@4" evaluate
 
 	\ Read RTL8139 operational register (1 byte)
 	: reg-read	( reg offset -- 1 byte of data from that offset )
@@ -266,7 +271,7 @@ fcode-version3
 		" net" encode-string " category" property
 		" RTL8139 PCI" encode-string " model" property
 		" pci10ec,8139" encode-string " compatible" property
-		macos-driver-buffer ac0e encode-bytes " driver,AAPL,MacOS,PowerPC" encode-string property
+		\ macos-driver-buffer ac0e encode-bytes " driver,AAPL,MacOS,PowerPC" encode-string property
 		\ HACK: fcode-rom-offset, is this required for boot?
 		0 encode-int " fcode-rom-offset" property
 
@@ -401,6 +406,36 @@ fcode-version3
 	0 instance value previous-capr
 	0 instance value last-pkt-len
 
+	: dump
+		" dump" evaluate
+	;
+
+	
+	0 instance value obp-get-block-xt
+	0 instance value tftp-block-addr
+	: get-tftp-block#
+		\ Cache the XT for nr-get-block# so we don't have to look it up every time (slow)
+		obp-tftp if
+			obp-get-block-xt if
+				\ obp-get-block-xt obp-tftp call-package \ SLOW, not needed if just reading a value (slow even though we have an XT cached)
+				tftp-block-addr l@ \ much faster (below we used the XT to get to the memory address backing it, so this is just a vanilla memory read)
+			else
+				\ " nr-get-block#" obp-tftp ihandle>phandle find-method if
+				" tftp-block#" obp-tftp ihandle>phandle find-method if
+					dup to obp-get-block-xt
+					>body to tftp-block-addr
+				else
+					." unable to find tftp-block# method" cr
+					0
+				then
+			then
+		else
+			0
+		then
+	;
+
+	0 instance value last-tftp-block
+
 	\ Open Firmware standard read method for network device
 	\ Returns actual number of bytes received or -2 if no packet is currently available
 	: read ( addr len -- retval )
@@ -410,25 +445,37 @@ fcode-version3
 		\ ." ISR " isr-reg reg-read2 .h cr
 		\ ." Cmd register " command-register reg-read .h cr
 		\ ." RCR " recv-config-reg reg-read4 .h cr
+
+		\ TODO/DEBUG: sleep to isolate problems/race conditions in driver
+		\ d# 50 ms
+
+		\ Check for RX overflow state and clear it
+		\ This state will prevent us from receiving any new packets until it is cleared
+		isr-reg reg-read2 50 and 0 > if
+			\ At least one of Rx Buffer Overflow or RX FIFO overflow is active
+			\ Per programming guide, we are recommended to clear all of them
+			\ This is not handled at this time
+			." At least one overflow interrupt is active, this is currently unhandled, RX is stopped, possible corruption! ISR = 0x" isr-reg reg-read2 .h cr
+			2drop
+			-2 exit \ no packet available
+		then
+
 		\ If the command register bit 1 is set, the buffer is empty and there is no packet stored
 		command-register reg-read 1 and 1 = if
-			\ ." No packet available, BUFE set" cr
-			2drop \ remove addr and len arguments from stack
-			\ Check for RX overflow state and clear it
-			isr-reg reg-read2 50 and 0 > if
-				\ At least one of Rx Buffer Overflow or RX FIFO overflow is active
-				\ Per programming guide, we are recommended to clear all of them
-				\ This is not handled at this time
-				." At least one overflow interrupt is active, this is currently unhandled, RX is stopped, possible corruption! ISR = 0x" isr-reg reg-read2 .h cr
+			should-dump if
+				." No packet available, BUFE set" cr
 			then
+			2drop \ remove addr and len arguments from stack
 			-2 exit \ return -2 for no packet available
 		then
 
-		\ Check for ROK condition in ISR, if this is not set then the packet is not done with DMA copy yet even though the "buffer empty" bit is not cleared
+		\ Check for ROK condition in ISR, if this is not set then the packet is not done with DMA copy yet even though the "buffer empty" bit is not set
 		isr-reg reg-read2 1 and 0 = if
 			\ ROK is not set, the packet is not ready yet
-			\ ." No packet available, ROK not set" cr
-			\ ." ISR " isr-reg reg-read2 .h cr
+			should-dump if
+				." No packet available, ROK not set" cr
+				." ISR " isr-reg reg-read2 .h cr
+			then
 			2drop
 			-2 exit
 		 then
@@ -461,7 +508,7 @@ fcode-version3
 
 		( dest addr, length to read, packet length )
 
-		\ TODO/DEBUG: check for packet length exceeding typical max we see from tcpdump
+		\ TODO/DEBUG: check for packet length exceeding typical max we see from tcpdump for TFTP packets
 		\ this would indicate client is desyncing and reading the wrong field for packet length
 		dup 232 > if
 			." Detected long packet length: " dup .h cr
@@ -488,10 +535,30 @@ fcode-version3
 
 		dup ( src addr, dest addr, length we will read, length we will read ) -rot ( src addr, length we will read, dest addr, length we will read ) 3 pick ( src addr, length we will read, dest addr, length we will read, src addr ) -rot ( src addr, length we will read, src addr, dest addr, length we will read )
 		move \ do the copy ( src addr, length we read )
-		nip \ remove extra src ( length we read )
+		
+		\ nip \ remove extra src ( length we read )
+
+		\ DEBUG: use the extra src addr for sanity checking the TFTP block number
+		swap ( length we read, src addr )
+
+		last-pkt-len 232 = if
+			\ tftp packet
+			\ read at src addr + 0x2d bytes for 2 byte word that indicates TFTP block number
+			\ check this for sanity
+			2c + w@ ( length we read, TFTP block number )
+			dup last-tftp-block < if ( length we read, TFTP block number )
+				." Found a TFTP block number " dup .d ." less than the last known TFTP block number " last-tftp-block .d cr
+				1 to should-dump
+			then
+			to last-tftp-block \ store last TFTP block number
+		else
+			drop \ get rid of src addr
+		then
 
 		\ Set CAPR to reflect we read this packet
 		\ We need to detect if this packet was in the wrap area "past" the end of the buffer
+
+		rx-read-offset 10 - 80 - 0 max to wrap-dump-start-offset
 
 		\ First read the length of the packet again
 		rx-read-offset rx-buffer-vaddr + w@ ( length we read, packet length )
@@ -510,8 +577,8 @@ fcode-version3
 			num-wraps 1 + to num-wraps
 			num-wraps d# 46 > if
 				\ ." Wrap: " num-wraps .d ." start address: (0x10 less than real): " rx-read-offset .h cr
-				rx-read-offset 10 - 80 - 0 max to wrap-dump-start-offset \ set start offset for dumps
-				0 to should-dump \ dump the buffer area of interest for the next 2 packets received
+				\ rx-read-offset 10 - 80 - 0 max to wrap-dump-start-offset \ set start offset for dumps
+				\ 0 to should-dump \ dump the buffer area of interest for the next 2 packets received
 			then
 		else
 			\ we didn't overrun so we don't care about overrun amount
@@ -528,8 +595,20 @@ fcode-version3
 			\ then
 		then
 
+		\ TODO/DEBUG: Dump CAPRs after TFTP block 5900 (where we see problems)
+		\ Also note every 100 TFTP blocks so we can see progress
+		get-tftp-block# d# 100 mod 0 = if
+			." TFTP block " get-tftp-block# .d cr
+		then
+		
+		get-tftp-block# d# 5900 > if
+		 	1 to should-dump
+		then
+
 		should-dump 0 > if
-			." Previous CAPR " previous-capr .h ." Packet length" last-pkt-len .h ." Next CAPR " rx-read-offset .h cr
+			." Previous CAPR 0x" previous-capr .h ." Packet length 0x" last-pkt-len .h ." Next CAPR 0x" rx-read-offset .h cr
+			." Received TFTP block " last-tftp-block .d cr
+			\ rx-buffer-vaddr wrap-dump-start-offset + 100 dump
 		then
 
 		\ Stack is now ( length we read )
