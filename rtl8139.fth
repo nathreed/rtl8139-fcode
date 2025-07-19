@@ -279,8 +279,6 @@ fcode-version3
 		\ obp-tftp init for booting
 		init-obp-tftp 0= if close false exit then
 
-		." Allocated memory at the end of open: " " dev /memory .properties dev pci1/@d/@4" evaluate cr
-
 		\ return true for successful open
 		true
 	;
@@ -297,6 +295,10 @@ fcode-version3
 		next-tx-descriptor 4 * tx-d0-status + to next-tx-descriptor-status-reg
 	;
 
+	0 instance value should-dump
+	\ Whether the packet size was adjusted to a minimum of 64 bytes (requiring a memory allocation and thus a memory free)
+	0 instance value adjusted-pkt-addr
+
 	\ Open Firmware standard write method for network device, returns actual number of bytes written
 	\ Packet must be complete with all addressing information, including source hardware address
 	: write ( src-addr len -- actual )
@@ -310,17 +312,25 @@ fcode-version3
 		\ ." TSAD " tsad-reg reg-read2 .h cr
 		\ ." TX src addr " over .h cr
 
+		\ Log TFTP ack if dumping
+		\ should-dump 0 > if
+		\	over ( src-addr len src-addr ) 2c + w@ ." Sending TFTP ack " .d cr
+		\ then
+
 		\ Check if the provided packet is too small
 		\ A size of 64 bytes works here, and 56 bytes did not (that was my first guess for 42 byte min payload + 14 byte ethernet header)
 		dup d# 64 swap - dup 0 > if ( src-addr, len, amount below minimum 64 bytes )
 			\ Provided packet length is less than 64 byte minimum, this will not be a valid packet if we send as is
 			over + ( src-addr, original len, new len )
 			alloc-mem ( src-addr, original len, new buffer address )
+			dup to adjusted-pkt-addr \ store address for later freeing
 			dup d# 64 erase \ Zero allocated memory
 			dup >r swap \ Stash a copy of new buffer address on the return stack temporarily (src-addr, new addr, original len ) and ( new addr )
 			move \ Do the copy
 			r> d# 64 \ Stack is now (new-src-addr, new-len which is 64 )  
-			\ ." Packet was smaller than minimum, adjusted" cr
+			\ should-dump 0 > if
+			\	." Packet was smaller than minimum, adjusted" cr
+			\ then
 		else
 			\ Provided packet length meets minimum, drop the negative delta and continue
 			drop
@@ -351,20 +361,30 @@ fcode-version3
 		\ Verify we have completion
 		next-tx-descriptor-status-reg reg-read2 8000 and
 		0 > if
-			\ ." Transmitted packet." cr
+			\ should-dump 0 > if
+			\	." Transmitted packet." cr
+			\ then
 			\ ." TX Status reg " next-tx-descriptor-status-reg reg-read2 .h cr
 			\ ." ISR " isr-reg reg-read2 .h cr
 			\ ." TSAD " tsad-reg reg-read2 .h cr
 			\ ." End TX for descriptor " next-tx-descriptor .h ." , incrementing" cr
 			incr-tx-descriptor
 		else
-			\ ." Packet did not transmit in time!" cr
+			\ should-dump 0 > if
+			\	." Packet did not transmit in time!" cr
+			\ then
 			\ Output tx descriptor status reg for debug purposes
 			\ ." TX Status reg " next-tx-descriptor-status-reg reg-read2 .h cr
 			\ ." TSAD " tsad-reg reg-read2 .h cr
 			\ ." End TX for descriptor " next-tx-descriptor .h ." , incrementing" cr
 			incr-tx-descriptor
 			drop 0 exit \ drop full packet len, replace with 0, return
+		then
+
+		\ If we allocated memory for adjusting the packet size earlier, we must free it.
+		adjusted-pkt-addr 0<> if
+			adjusted-pkt-addr d# 64 free-mem
+			0 to adjusted-pkt-addr
 		then
 
 		\ len is still on the stack; we return it because we have written the whole thing.
@@ -404,7 +424,6 @@ fcode-version3
 	;
 
 	0 instance value num-wraps
-	0 instance value should-dump
 	0 instance value wrap-dump-start-offset
 	0 instance value previous-capr
 	0 instance value last-pkt-len
@@ -506,6 +525,8 @@ fcode-version3
 		dup FFF0 = if
 			." Found packet but it's not done DMA yet, not able to read it!" cr
 			3drop \ remove dest addr, length to read, packet length
+			\ Need to flip header back because we'll be checking it again
+			rx-read-offset rx-buffer-vaddr + 4 lbflips
 			-2 exit
 		then
 
@@ -603,7 +624,7 @@ fcode-version3
 			." TFTP block " get-tftp-block# .d cr
 		then
 		
-		\ get-tftp-block# d# 8180 > if
+		\ get-tftp-block# d# 8280 > if
 		\  	1 to should-dump
 		\ then
 
@@ -613,7 +634,7 @@ fcode-version3
 			\ get-tftp-block# d# 8115 > if
 			\	wrap-dump-start-offset debug-dump-buffer
 			\ then
-			" dev /memory .properties" evaluate \ check allocated memory
+			\ " dev /memory .properties" evaluate \ check allocated memory
 		then
 
 		\ Stack is now ( length we read )
