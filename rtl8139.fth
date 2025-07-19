@@ -235,6 +235,7 @@ fcode-version3
 	: open
 		\ Start with fresh line for any output we produce
 		cr
+		." Allocated memory at the beginning of open: " " dev /memory .properties dev pci1/@d/@4" evaluate cr
 		\ Enable memory space access and bus mastering
 		my-space 04 + " config-w@" $call-parent \ ( -- config register 04) - read command register
 		6 or \ (command reg contents -- modified command reg contents) - 0x06 = bit 1 and 2 set (memory space & bus master)
@@ -277,6 +278,8 @@ fcode-version3
 
 		\ obp-tftp init for booting
 		init-obp-tftp 0= if close false exit then
+
+		." Allocated memory at the end of open: " " dev /memory .properties dev pci1/@d/@4" evaluate cr
 
 		\ return true for successful open
 		true
@@ -478,7 +481,7 @@ fcode-version3
 			then
 			2drop
 			-2 exit
-		 then
+		then
 
 		\ DMA sync before we read
 		rx-buffer-vaddr rx-buffer-baddr rx-buffer-len my-dma-sync
@@ -516,10 +519,9 @@ fcode-version3
 
 		dup to last-pkt-len
 
+		( dest addr, length to read, packet length )
+
 		\ Done with all checks, we are for sure going to handle this packet now.
-		\ Clear RX interrupt
-		isr-reg reg-read2 1 or isr-reg reg-write2
-		\ ." Proceed RX, ISR = " isr-reg reg-read2 .h cr
 
 		\ dup ." Initial RX of packet with length " .h ." stack is " .s cr
 		\ Per the programming guide there is a 4 byte CRC on the end of the packet, we don't want to copy that to our caller
@@ -529,7 +531,7 @@ fcode-version3
 
 		\ obtain source address for memory copy: RX buffer + RX read offset + 4 bytes (skip header)
 		rx-read-offset ( addr, read len, rx read offset ) rx-buffer-vaddr ( addr, read len, rx read offset, rx buffer vaddr ) + ( addr, read len, absolute read address )
-		4 ( addr, read len, absolute read address, 4 ) + ( dest addr, length we will read, src addr ) 
+		4 + ( dest addr, length we will read, src addr ) 
 		-rot ( src addr, dest addr, length we will read )
 
 
@@ -538,18 +540,18 @@ fcode-version3
 		
 		\ nip \ remove extra src ( length we read )
 
-		\ DEBUG: use the extra src addr for sanity checking the TFTP block number
+		\ DEBUG: use the extra src addr for sanity checking the TFTP block number (comment out the nip above if using this)
 		swap ( length we read, src addr )
 
 		last-pkt-len 232 = if
 			\ tftp packet
-			\ read at src addr + 0x2d bytes for 2 byte word that indicates TFTP block number
+			\ read at src addr + 0x2c bytes for 2 byte word that indicates TFTP block number
 			\ check this for sanity
 			2c + w@ ( length we read, TFTP block number )
-			dup last-tftp-block < if ( length we read, TFTP block number )
-				." Found a TFTP block number " dup .d ." less than the last known TFTP block number " last-tftp-block .d cr
-				1 to should-dump
-			then
+			\ dup last-tftp-block < if ( length we read, TFTP block number )
+				\ ." Found a TFTP block number " dup .d ." less than the last known TFTP block number " last-tftp-block .d cr
+				\ 0 to should-dump
+			\ then
 			to last-tftp-block \ store last TFTP block number
 		else
 			drop \ get rid of src addr
@@ -601,24 +603,63 @@ fcode-version3
 			." TFTP block " get-tftp-block# .d cr
 		then
 		
-		get-tftp-block# d# 5900 > if
-		 	1 to should-dump
-		then
+		\ get-tftp-block# d# 8180 > if
+		\  	1 to should-dump
+		\ then
 
 		should-dump 0 > if
 			." Previous CAPR 0x" previous-capr .h ." Packet length 0x" last-pkt-len .h ." Next CAPR 0x" rx-read-offset .h cr
 			." Received TFTP block " last-tftp-block .d cr
-			\ rx-buffer-vaddr wrap-dump-start-offset + 100 dump
+			\ get-tftp-block# d# 8115 > if
+			\	wrap-dump-start-offset debug-dump-buffer
+			\ then
+			" dev /memory .properties" evaluate \ check allocated memory
 		then
 
 		\ Stack is now ( length we read )
+
+
+		\ Determine whether to clear RXOK interrupt
+		\ It's possible that we received another packet before RXOK was cleared, so we don't want to clear it (which would make us not handle the next packet) if there might be another packet waiting
+		\ command-register reg-read 1 and 1 = if \ check if BUFE is set, doesn't work
+		cbr-reg reg-read2 8000 mod rx-read-offset = if \ CBR (mod 8000 since it seems to alternate between being 0x8000 ahead of CAPR and not) is equal to CAPR (adjusted)
+			\ we can clear RXOK without problems
+			isr-reg reg-read2 1 or isr-reg reg-write2
+		else
+			should-dump 0 > if
+				." Not clearing RXOK: CBR = 0x" cbr-reg reg-read2 .h cr
+			then
+		then
+
+		\ Dump buffer for short packets (check if this is what's causing us to exit with load-size too small)
+		\ last-pkt-len 232 < last-tftp-block 5 > and if
+		\	." Received packet less than 0x232 long! Dump..." cr
+		\	wrap-dump-start-offset debug-dump-buffer
+		\ then
+
 		\ Return out the length actually received
 		\ dup ." RX return we read length " .h cr
 	;
 
+	0 value did-allocate-extra-space
+
 	\ Open Firmware standard load function for bootable network device
 	\ Uses obp-tftp
 	: load
+		\ HORRIBLE HORRIBLE HACK
+		\ Default OF shared load implementation doesn't allocate enough space (4 MiB) to load mach.macosx.mkext (7.7 MiB) during Mac OS X boot
+		\ Allocate a bunch of space right after the space it allocates so that we have one contiguous mapped area for the load to go
+		\ This is the last thing we need to load before booting into Mac OS X (which will take over the memory map) so it's OK that nobody ever deallocates the extra space
+		\ TODO: Probably move this into a custom CHRP boot script that runs before BootX, that would be cleanest/most realistic
+		did-allocate-extra-space 0 = if
+			\ Claim 8 MiB of physical memory at 4 MiB after load-base (total 12 MiB)
+			" dev /memory load-base 400000 + 800000 0 claim" evaluate drop
+			\ Map this memory 1:1 to a virtual address (so it's both physically and virtually contiguous with the default 4 MiB)
+			" dev /cpus/@0 load-base 400000 + dup 800000 10 map" evaluate
+			1 to did-allocate-extra-space
+		then
+		." Allocated memory at the beginning of load" cr
+		" dev pci1/@d/@4" evaluate
 		" load" obp-tftp $call-method
 	;
 
