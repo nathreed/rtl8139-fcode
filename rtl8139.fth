@@ -52,6 +52,18 @@ fcode-version3
 	\ 2001000 macos-driver-buffer ac0e move
 	\ cr ." Copied Mac OS driver to own buffer. Beginning of that location: " macos-driver-buffer rl@ .h cr
 
+	\ Mac OS X driver
+	\ Needs to be read as soon as this FCode is run (i.e. on byte-load) since byte-load unmaps the loaded rom file on completion
+	164d1 constant osx-driver-len \ length of the mkext file
+	0 value osx-driver-buffer
+	\ Driver is too large to allocate space for with alloc-mem or buffer:
+	\ Instead we will claim and map a dedicated area for it.
+	\ We place it 12 MiB after load-base -- the 12 MiB is allocated for the loading area for client program and the files it loads (see below)
+	" dev /memory load-base d00000 + 164d1 0 claim " evaluate to osx-driver-buffer
+	" dev /cpus/@0 load-base d00000 + dup 164d1 10 map" evaluate
+	" load-base" evaluate 2000 + osx-driver-buffer osx-driver-len move \ Copy driver from its current location (load-base + 8192 bytes -- where it was placed in the combined ROM file) to the location we just allocated for it.
+	cr ." Copied Mac OS X driver to its own buffer. Beginning of that location: " osx-driver-buffer rl@ .h cr
+
 	\ TEMP/DEBUG: Set debug property for Mac OS - hardcodes PCI layout from my power mac g4
 	" dev /" evaluate
 	\ 2137 encode-int " AAPL,debug" property \ some extra prints, mostly while copying device tree. Prints warning that EtherPrintf will stop OpenTransport from loading its Ethernet driver even though we're not loading EtherPrintf with this 
@@ -230,6 +242,7 @@ fcode-version3
 		obp-tftp ?dup if close-package then
 	;
 
+	true value should-add-driver?
 
 	\ Open Firmware standard open function, get the device ready for use
 	: open
@@ -273,6 +286,13 @@ fcode-version3
 		" RTL8139 PCI" encode-string " model" property
 		" pci10ec,8139" encode-string " compatible" property
 		\ macos-driver-buffer ac0e encode-bytes " driver,AAPL,MacOS,PowerPC" encode-string property
+		should-add-driver? if
+			osx-driver-buffer osx-driver-len encode-bytes " driver,AAPL,MacOSX,PowerPC" encode-string property
+			\ Free up the space after we encoded the driver
+			osx-driver-buffer osx-driver-len " dev /cpus/@0 unmap" evaluate
+			osx-driver-buffer osx-driver-len " dev /memory release" evaluate
+			false to should-add-driver?
+		then
 		\ HACK: fcode-rom-offset, is this required for boot?
 		0 encode-int " fcode-rom-offset" property
 
@@ -679,7 +699,6 @@ fcode-version3
 			" dev /cpus/@0 load-base 400000 + dup 800000 10 map" evaluate
 			1 to did-allocate-extra-space
 		then
-		." Allocated memory at the beginning of load" cr
 		" dev pci1/@d/@4" evaluate
 		" load" obp-tftp $call-method
 	;
