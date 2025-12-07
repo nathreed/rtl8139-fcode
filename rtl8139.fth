@@ -70,10 +70,6 @@ fcode-version3
 	\ 40000001 encode-int " AAPL,debug" property \ halt after end of FCode (this is right before boot would normally terminate OF and hand control to MacOS - useful for browsing device tree after Trampoline has finished)
 	2020001 encode-int " AAPL,debug" property \ display nanokernel log during boot
 
-	\ Debug: Hack a method into obp-tftp that we will use for reading the current block number
-	\ This is used to activate logging past a certain block number
-	" dev /packages/obp-tftp : nr-get-block# tftp-block# ;" evaluate
-
 	\ Take us back to the device where we belong
 	" dev pci1/@d/@4" evaluate
 
@@ -217,9 +213,6 @@ fcode-version3
 		" obp-tftp" find-package if my-args rot open-package else 0
 		then
 		dup to obp-tftp dup 0= if
-		( phandle )
-		( ihandle )
-		( ihandle | 0 )
 		." Cannot open OBP standard TFTP package" cr
 		then
 	;
@@ -275,7 +268,7 @@ fcode-version3
 
 		\ Expose mac-address property with correct value
 		setup-mac-addr
-		\ MTU property, 1580 is a somewhat arbitrary value set below 1600 bytes Tx descriptor allocation size
+		\ MTU property
 		mtu encode-int " max-frame-size" property
 
 		" pci10ec,8139" device-name
@@ -287,13 +280,14 @@ fcode-version3
 		" pci10ec,8139" encode-string " compatible" property
 		\ macos-driver-buffer ac0e encode-bytes " driver,AAPL,MacOS,PowerPC" encode-string property
 		should-add-driver? if
+			\ Encode the driver from the specially mapped/allocated memory for it
 			osx-driver-buffer osx-driver-len encode-bytes " driver,AAPL,MacOSX,PowerPC" encode-string property
 			\ Free up the space after we encoded the driver
 			osx-driver-buffer osx-driver-len " dev /cpus/@0 unmap" evaluate
 			osx-driver-buffer osx-driver-len " dev /memory release" evaluate
 			false to should-add-driver?
 		then
-		\ HACK: fcode-rom-offset, is this required for boot?
+		\ HACK: fcode-rom-offset, is this required for boot? don't think so
 		0 encode-int " fcode-rom-offset" property
 
 		\ obp-tftp init for booting
@@ -315,8 +309,9 @@ fcode-version3
 		next-tx-descriptor 4 * tx-d0-status + to next-tx-descriptor-status-reg
 	;
 
+	\ debug dump control
 	0 instance value should-dump
-	\ Whether the packet size was adjusted to a minimum of 64 bytes (requiring a memory allocation and thus a memory free)
+	\ Address of packet that was adjusted to a minimum of 64 bytes (requiring a memory allocation and thus a memory free)
 	0 instance value adjusted-pkt-addr
 
 	\ Open Firmware standard write method for network device, returns actual number of bytes written
@@ -326,11 +321,6 @@ fcode-version3
 			." RTL8139: Attempted to write data exceeding one MTU, this is not implemented!" cr
 			0 exit \ Return 0 bytes actually written
 		then
-
-		\ ." Begin TX with descriptor " next-tx-descriptor .h cr
-		\ ." Status reg is " next-tx-descriptor-status-reg .h cr
-		\ ." TSAD " tsad-reg reg-read2 .h cr
-		\ ." TX src addr " over .h cr
 
 		\ Log TFTP ack if dumping
 		\ should-dump 0 > if
@@ -443,6 +433,7 @@ fcode-version3
 		." ******END DUMP*********" cr
 	;
 
+	\ Debug only properties
 	0 instance value num-wraps
 	0 instance value wrap-dump-start-offset
 	0 instance value previous-capr
@@ -456,13 +447,11 @@ fcode-version3
 	0 instance value obp-get-block-xt
 	0 instance value tftp-block-addr
 	: get-tftp-block#
-		\ Cache the XT for nr-get-block# so we don't have to look it up every time (slow)
 		obp-tftp if
 			obp-get-block-xt if
 				\ obp-get-block-xt obp-tftp call-package \ SLOW, not needed if just reading a value (slow even though we have an XT cached)
 				tftp-block-addr l@ \ much faster (below we used the XT to get to the memory address backing it, so this is just a vanilla memory read)
 			else
-				\ " nr-get-block#" obp-tftp ihandle>phandle find-method if
 				" tftp-block#" obp-tftp ihandle>phandle find-method if
 					dup to obp-get-block-xt
 					>body to tftp-block-addr
@@ -481,16 +470,6 @@ fcode-version3
 	\ Open Firmware standard read method for network device
 	\ Returns actual number of bytes received or -2 if no packet is currently available
 	: read ( addr len -- retval )
-		\ ." PACKET READ METHOD stack is " .s cr
-		\ ." CAPR " capr-reg reg-read2 .h cr
-		\ ." CBR " cbr-reg reg-read2 .h cr
-		\ ." ISR " isr-reg reg-read2 .h cr
-		\ ." Cmd register " command-register reg-read .h cr
-		\ ." RCR " recv-config-reg reg-read4 .h cr
-
-		\ TODO/DEBUG: sleep to isolate problems/race conditions in driver
-		\ d# 50 ms
-
 		\ Check for RX overflow state and clear it
 		\ This state will prevent us from receiving any new packets until it is cleared
 		isr-reg reg-read2 50 and 0 > if
@@ -529,7 +508,7 @@ fcode-version3
 		\ The first 16 bits are the size of the packet and the last 16 bits are the "Receive Status Register in Rx Packet Header" per datasheet pp.10
 		\ stack is currently ( dest_addr, length to read )
 
-		\ TODO / DEBUG
+		\ Only for debug
 		rx-read-offset to previous-capr
 
 
@@ -552,19 +531,12 @@ fcode-version3
 
 		( dest addr, length to read, packet length )
 
-		\ TODO/DEBUG: check for packet length exceeding typical max we see from tcpdump for TFTP packets
-		\ this would indicate client is desyncing and reading the wrong field for packet length
-		dup 232 > if
-			." Detected long packet length: " dup .h cr
-		then
-
 		dup to last-pkt-len
 
 		( dest addr, length to read, packet length )
 
 		\ Done with all checks, we are for sure going to handle this packet now.
 
-		\ dup ." Initial RX of packet with length " .h ." stack is " .s cr
 		\ Per the programming guide there is a 4 byte CRC on the end of the packet, we don't want to copy that to our caller
 		4 - ( dest addr, length client wants, packet length less CRC )
 		\ we will read the lesser of the packet length or the length the caller wants
@@ -580,7 +552,6 @@ fcode-version3
 		move \ do the copy ( src addr, length we read )
 		
 		\ nip \ remove extra src ( length we read )
-
 		\ DEBUG: use the extra src addr for sanity checking the TFTP block number (comment out the nip above if using this)
 		swap ( length we read, src addr )
 
@@ -601,6 +572,7 @@ fcode-version3
 		\ Set CAPR to reflect we read this packet
 		\ We need to detect if this packet was in the wrap area "past" the end of the buffer
 
+		\ For debug only
 		rx-read-offset 10 - 80 - 0 max to wrap-dump-start-offset
 
 		\ First read the length of the packet again
@@ -615,14 +587,14 @@ fcode-version3
 
 			set-rx-read-offset \ Overrun amount is on the stack, this is the base for new CAPR (it already includes the 4 byte header)
 			
-			\ TODO/DEBUG: log the computed start address for the wraparound packet after 42 buffer wraps
+			\ DEBUG: log the computed start address for the wraparound packet after 42 buffer wraps
 			\ We seem to run into trouble around 45
 			num-wraps 1 + to num-wraps
-			num-wraps d# 46 > if
+			\ num-wraps d# 46 > if
 				\ ." Wrap: " num-wraps .d ." start address: (0x10 less than real): " rx-read-offset .h cr
 				\ rx-read-offset 10 - 80 - 0 max to wrap-dump-start-offset \ set start offset for dumps
 				\ 0 to should-dump \ dump the buffer area of interest for the next 2 packets received
-			then
+			\ then
 		else
 			\ we didn't overrun so we don't care about overrun amount
 			drop ( length we read, packet length )
@@ -631,14 +603,14 @@ fcode-version3
 			\ Note we STILL NEED the +4 for header here because we're dealing with the packet length, not the overrun amount!
 			rx-read-offset + 4 + set-rx-read-offset \ CAPR + packet length + 4 for header is then new offset, set-rx-read-offset handles the rest
 
-			\ TODO/DEBUG: dump buffer start so we can see if wraps are aligning with what we expect
+			\ DEBUG: dump buffer start so we can see if wraps are aligning with what we expect
 			\ should-dump 0 > if
 			\	wrap-dump-start-offset debug-dump-buffer
 			\	should-dump 1 - to should-dump
 			\ then
 		then
 
-		\ TODO/DEBUG: Dump CAPRs after TFTP block 5900 (where we see problems)
+		\ DEBUG: Dump CAPRs after TFTP block 5900 (where we see problems)
 		\ Also note every 100 TFTP blocks so we can see progress
 		get-tftp-block# d# 100 mod 0 = if
 			." TFTP block " get-tftp-block# .d cr
