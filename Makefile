@@ -16,6 +16,7 @@ $(FCODE_OUT): $(FCODE_SRC)
 
 $(ROM_OUT): $(FCODE_OUT) $(MACOS_DRIVER)
 	cp $(FCODE_OUT) $(ROM_OUT)
+	# driver file is placed at static offset into combined rom file, FCode will load from here and put into property
 	dd if=$(MACOS_DRIVER) of=$(ROM_OUT) bs=1 seek=$(DRIVER_OFFSET)
 
 clean:
